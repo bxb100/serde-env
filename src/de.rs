@@ -149,11 +149,61 @@ struct Deserializer(Node);
 impl<'de> de::Deserializer<'de> for Deserializer {
     type Error = Error;
 
-    fn deserialize_any<V>(self, _vis: V) -> Result<V::Value, Self::Error>
+    /// https://serde.rs/impl-deserialize.html
+    /// The various other deserialize_* methods. Non-self-describing formats like Postcard need
+    /// to be told what is in the input in order to deserialize it.
+    /// The deserialize_* methods are hints to the deserializer for how to interpret the next
+    /// piece of input. Non-self-describing formats are not able to deserialize something like serde_json::Value
+    /// which relies on Deserializer::deserialize_any.
+    ///
+    ///
+    /// support:
+    /// 1. array: 1,2,3
+    /// 2. bool: true or false or True or False
+    /// 3. number: must be valid u64 or i64
+    /// 4. string: "hello"
+    /// 5. Enums with unit variants see <https://github.com/Xuanwo/serde-env/pull/16>
+    fn deserialize_any<V>(self, vis: V) -> Result<V::Value, Self::Error>
     where
         V: Visitor<'de>,
     {
-        Err(de::Error::custom("deserialize_any is not supported"))
+        // dbg!(&self.0.value());
+        let bytes = self.0.value().as_bytes();
+        if bytes.is_empty() {
+            return vis.visit_none();
+        }
+        let first = bytes[0];
+
+        match first {
+            _ if self.0.value().contains(',') => {
+                return self.deserialize_seq(vis);
+            }
+            b'0'..=b'9' => {
+                if bytes.iter().all(|&b| b.is_ascii_digit()) {
+                    return match self.0.value().parse::<u64>() {
+                        Ok(v) => vis.visit_u64(v),
+                        Err(_) => self.deserialize_str(vis),
+                    };
+                }
+            }
+            b'-' => {
+                if bytes.iter().skip(1).all(|&b| b.is_ascii_digit()) {
+                    return match self.0.value().parse::<i64>() {
+                        Ok(v) => vis.visit_i64(v),
+                        Err(_) => self.deserialize_str(vis),
+                    };
+                }
+            }
+            b't' | b'f' | b'T' | b'F' => {
+                if bytes.eq_ignore_ascii_case(b"true") {
+                    return vis.visit_bool(true);
+                } else if bytes.eq_ignore_ascii_case(b"false") {
+                    return vis.visit_bool(false);
+                }
+            }
+            _ => {}
+        };
+        self.deserialize_str(vis)
     }
 
     fn deserialize_bool<V>(self, vis: V) -> Result<V::Value, Self::Error>
@@ -249,6 +299,7 @@ impl<'de> de::Deserializer<'de> for Deserializer {
     where
         V: Visitor<'de>,
     {
+
         vis.visit_str(self.0.value())
     }
 
@@ -346,13 +397,6 @@ impl<'de> de::Deserializer<'de> for Deserializer {
         vis.visit_map(MapAccessor::new(keys, self.0))
     }
 
-    fn deserialize_identifier<V>(self, vis: V) -> Result<V::Value, Self::Error>
-    where
-        V: Visitor<'de>,
-    {
-        self.deserialize_string(vis)
-    }
-
     fn deserialize_enum<V>(
         self,
         _name: &'static str,
@@ -365,6 +409,13 @@ impl<'de> de::Deserializer<'de> for Deserializer {
         let keys = variants.iter().map(|v| v.to_string()).collect();
 
         vis.visit_enum(EnumAccessor::new(keys, self.0))
+    }
+
+    fn deserialize_identifier<V>(self, vis: V) -> Result<V::Value, Self::Error>
+    where
+        V: Visitor<'de>,
+    {
+        self.deserialize_string(vis)
     }
 }
 
@@ -477,7 +528,9 @@ impl<'de> de::EnumAccess<'de> for EnumAccessor {
         let key = self
             .keys
             .find(|key| self.node.value() == key)
-            .ok_or_else(|| de::Error::custom("no variant found"))?;
+            .ok_or_else(|| {
+                de::Error::custom(format!("no variant `{}` found", self.node.value()))
+            })?;
 
         let variant = VariantAccessor::new(self.node);
         Ok((seed.deserialize(key.into_deserializer())?, variant))
@@ -531,8 +584,9 @@ impl<'de> de::VariantAccess<'de> for VariantAccessor {
 
 #[cfg(test)]
 mod tests {
-    use serde::Deserialize;
     use std::collections::HashMap;
+
+    use serde::Deserialize;
 
     use super::*;
 
@@ -849,5 +903,66 @@ mod tests {
                 }
             )
         })
+    }
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct TestFlatten {
+        silent: Option<String>,
+        pub_hosted_url: String,
+        #[serde(rename = "pub")]
+        pub_: TestPub,
+        #[serde(flatten)]
+        inner: TestFlattenInner,
+    }
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct TestPub {
+        hosted: TestPubInner,
+    }
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct TestPubInner {
+        url: String,
+    }
+
+    #[derive(Deserialize, Debug, PartialEq)]
+    struct TestFlattenInner {
+        port: u32,
+        enable: bool,
+        t: Option<u64>,
+        t2: String,
+        foo: Vec<u32>,
+        foo2: Vec<u32>,
+        foo3: Option<Vec<u32>>,
+    }
+
+    #[test]
+    fn test_from_env_flatten() {
+        temp_env::with_vars(
+            vec![
+                ("port", Some("123")),
+                ("enable", Some("True")),
+                ("enable", Some("False")),
+                ("silent", Some("")),
+                ("t", Some("18446744073709551615")),
+                ("t2", Some("18446744073709551616")),
+                ("PUB_HOSTED_URL", Some("https://pub.dev")),
+                ("foo", Some("1,2,3")),
+                ("foo2", Some("1,2,")),
+                ("foo3", Some("1,")),
+                ("e", Some("X")),
+                ("e", Some("Z")),
+                ("e_a", Some("1")),
+            ],
+            || {
+                let n = Node::from_env();
+
+                let t: TestFlatten =  TestFlatten::deserialize(Deserializer(n)).expect("must success");
+                dbg!(&t);
+                assert_eq!(t.inner.port, 123);
+                assert!(!t.inner.enable);
+                assert_eq!(t.pub_.hosted.url, t.pub_hosted_url);
+                assert_eq!(t.inner.foo, vec![1, 2, 3]);
+            },
+        )
     }
 }

@@ -43,6 +43,10 @@ impl Node {
     pub(crate) fn into_value(self) -> String {
         self.0
     }
+    
+    pub(crate) fn childrens(&self) -> Vec<String> {
+        self.1.keys().cloned().collect()
+    }
 
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty() && self.1.is_empty()
@@ -90,7 +94,7 @@ impl Node {
     /// Push into node with full key name.
     ///
     /// `node.push("abc_def", v)` => `node.push("abc", "").push("def", v)`
-    fn push(&mut self, k: &str, v: &str) {
+    pub(crate) fn push(&mut self, k: &str, v: &str) {
         match k.split_once('_') {
             None => {
                 self.1
